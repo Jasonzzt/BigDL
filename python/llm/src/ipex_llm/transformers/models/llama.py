@@ -215,12 +215,18 @@ def should_use_fast_rope(self, query_states, position_ids):
     return use_fuse_rope
 
 
-def should_split_qkv_tensor(query_states, output_attentions):
-    if not output_attentions and query_states.dtype == torch.float16 and \
-            query_states.shape[2] >= 6800:
-        # split tensor for memory block limitation
-        # support fp16 and set input length threshold at 6800 for now
-        return True
+def should_split_qkv_tensor(query_states, bsz, num_heads, q_len, kv_seq_len, output_attentions):
+    if not output_attentions:
+        if os.environ.get("IPEX_LLM_SPLIT_QKV", None) is not None:
+            return os.environ.get("IPEX_LLM_SPLIT_QKV", None) == "1"
+        elif query_states.dtype == torch.float16 and \
+                query_states.shape[2] >= 6800:
+            # split tensor for memory block limitation
+            # support fp16 and set input length threshold at 6800 for now
+            return True
+        elif query_states.element_size()*bsz*num_heads*q_len*kv_seq_len >= 4*1024**3:
+            # attn_weight size larger than memory block limitation 4GB
+            return True
     return False
 
 
@@ -438,7 +444,7 @@ def llama_attention_forward_4_31_quantized(
         if use_cache:
             k_cache, v_cache = init_fp8_kv_cache(
                 bsz, self.num_key_value_heads, kv_seq_len, self.head_dim,
-                device=query_states.device, new_layout=True
+                device=query_states.device
             )
             key_states, value_states = append_fp8_kv_cache(k_cache, v_cache,
                                                            key_states, value_states)
@@ -446,7 +452,7 @@ def llama_attention_forward_4_31_quantized(
     else:
         k_cache, v_cache = past_key_value
         key_states, value_states = append_fp8_kv_cache(k_cache, v_cache,
-                                                       key_states, value_states, new_layout=True)
+                                                       key_states, value_states)
         kv_seq_len = key_states.shape[-2]
         past_key_value = (key_states, value_states)
 
@@ -1029,7 +1035,8 @@ def llama_attention_forward_4_36_quantized(
     if len(past_key_value.key_cache) <= self.layer_idx:
         repeated_key_states = repeat_kv(key_states, self.num_key_value_groups)
         repeated_value_states = repeat_kv(value_states, self.num_key_value_groups)
-        if should_split_qkv_tensor(query_states, output_attentions):
+        if should_split_qkv_tensor(query_states, bsz, self.num_heads,
+                                   q_len, kv_seq_len, output_attentions):
             attn_output, _ = native_sdp_split_qkv_tensor(query_states, repeated_key_states,
                                                          repeated_value_states, attention_mask,
                                                          bsz, q_len, kv_seq_len, self.head_dim,
@@ -1067,13 +1074,11 @@ def llama_attention_forward_4_36_quantized(
         if use_cache:
             cache_kwargs = None
             key_states, value_states = past_key_value.update(key_states, value_states,
-                                                             self.layer_idx, cache_kwargs,
-                                                             new_layout=True)
+                                                             self.layer_idx, cache_kwargs)
     else:
         cache_kwargs = None  # Specific to RoPE models
         key_states, value_states = past_key_value.update(key_states, value_states,
-                                                         self.layer_idx, cache_kwargs,
-                                                         new_layout=True)
+                                                         self.layer_idx, cache_kwargs)
         kv_seq_len = key_states.shape[-2]
         if not use_sdp_fp8(q_len, key_states.shape[2], query_states):
             key_states, value_states = restore_fp8_kv_cache(key_states, value_states,
@@ -1405,7 +1410,7 @@ def llama_attention_forward_4_36_original(
 
 def native_sdp(query, key, value, attention_mask,
                bsz, q_len, kv_seq_len, head_dim, num_heads, output_attentions):
-    if should_split_qkv_tensor(query, output_attentions):
+    if should_split_qkv_tensor(query, bsz, num_heads, q_len, kv_seq_len, output_attentions):
         return native_sdp_split_qkv_tensor(query, key, value, attention_mask,
                                            bsz, q_len, kv_seq_len, head_dim, num_heads)
     else:
